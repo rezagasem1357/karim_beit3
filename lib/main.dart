@@ -162,6 +162,44 @@ int _inventoryDaysRemainingForDate(DateTime date) {
   return (30 - day).clamp(0, 30);
 }
 
+DateTime _jalaliToGregorian(int jy, int jm, int jd) {
+  var y = jy - 979;
+  var gy = 1600 + 400 * (y ~/ 12053);
+  y %= 12053;
+  gy += 4 * (y ~/ 1461);
+  y %= 1461;
+  if (y > 365) {
+    gy += (y - 1) ~/ 365;
+    y = (y - 1) % 365;
+  }
+
+  var dayOfYear = y + 1;
+  const monthDays = <int>[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  var gm = 1;
+  while (gm <= 12) {
+    final daysInMonth = monthDays[gm - 1] +
+        ((gm == 2 && ((gy % 4 == 0 && gy % 100 != 0) || gy % 400 == 0)) ? 1 : 0);
+    if (dayOfYear <= daysInMonth) break;
+    dayOfYear -= daysInMonth;
+    gm++;
+  }
+  return DateTime(gy, gm, dayOfYear);
+}
+
+class CountdownEvent {
+  final String title;
+  final String date;
+
+  const CountdownEvent({required this.title, required this.date});
+
+  Map<String, dynamic> toJson() => {'title': title, 'date': date};
+
+  factory CountdownEvent.fromJson(Map<String, dynamic> json) => CountdownEvent(
+        title: (json['title'] ?? '').toString(),
+        date: (json['date'] ?? '').toString(),
+      );
+}
+
 // ==================== ابزارهای فرمت قیمت ====================
 
 String _formatPrice(int price) {
@@ -963,6 +1001,8 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
 
   String _userName = '';
   String _userGender = 'male';
+  List<CountdownEvent> _countdownEvents = [];
+  bool _showWelcomeCard = true;
 
   @override
   void initState() {
@@ -974,6 +1014,8 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
     _loadTrashAndCleanup();
     _loadInventoryCounts();
     _loadSettings();
+    _loadCountdownEvents();
+    _loadWelcomeVisibility();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _initializeEntryNotifications();
@@ -1007,6 +1049,220 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
       _userGender =
           prefs.getString('user_gender') == 'female' ? 'female' : 'male';
     });
+  }
+
+  Future<void> _loadCountdownEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('countdown_events');
+    List<CountdownEvent> events = [];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final list = jsonDecode(raw) as List;
+        events = list
+            .map((e) => CountdownEvent.fromJson(Map<String, dynamic>.from(e)))
+            .where((e) => e.title.trim().isNotEmpty && e.date.trim().isNotEmpty)
+            .toList();
+      } catch (_) {
+        events = [];
+      }
+    }
+    if (!mounted) return;
+    setState(() => _countdownEvents = events);
+  }
+
+  Future<void> _loadWelcomeVisibility() async {
+    final prefs = await SharedPreferences.getInstance();
+    final hiddenDate = prefs.getString('welcome_hidden_date');
+    if (!mounted) return;
+    setState(() => _showWelcomeCard = hiddenDate != _todayJalali());
+  }
+
+  Future<void> _hideWelcomeForToday() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('welcome_hidden_date', _todayJalali());
+    if (mounted) setState(() => _showWelcomeCard = false);
+  }
+
+  List<Map<String, dynamic>> _getWelcomeEvents() {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final result = <Map<String, dynamic>>[
+      {
+        'title': 'انبارگردانی',
+        'date': null,
+        'remaining': _inventoryDaysRemainingForDate(now),
+        'fixed': true,
+      },
+    ];
+
+    for (final event in _countdownEvents) {
+      final parts = event.date.split('/');
+      if (parts.length != 3) continue;
+      final jy = int.tryParse(parts[0]);
+      final jm = int.tryParse(parts[1]);
+      final jd = int.tryParse(parts[2]);
+      if (jy == null || jm == null || jd == null) continue;
+      try {
+        final date = _jalaliToGregorian(jy, jm, jd);
+        final target = DateTime(date.year, date.month, date.day);
+        final remaining = target.difference(today).inDays;
+        if (remaining >= 0) {
+          result.add({
+            'title': event.title,
+            'date': event.date,
+            'remaining': remaining,
+            'fixed': false,
+          });
+        }
+      } catch (_) {}
+    }
+
+    result.sort((a, b) => (a['remaining'] as int).compareTo(b['remaining'] as int));
+    return result;
+  }
+
+  Widget _buildWelcomeEvents() {
+    final events = _getWelcomeEvents();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(.12),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(.18)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.event_note_rounded, color: Colors.white, size: 20),
+              SizedBox(width: 7),
+              Text(
+                'روز شمار رویدادهای مهم',
+                style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ...events.map((event) {
+            final remaining = event['remaining'] as int;
+            final title = event['title'] as String;
+            final text = remaining == 0
+                ? 'امروز • $title'
+                : '${_toPersianDigits(remaining.toString())} روز مانده تا $title';
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(
+                children: [
+                  const Icon(Icons.circle, color: Colors.white, size: 7),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      text,
+                      style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWelcomeCard() {
+    if (!_showWelcomeCard) return const SizedBox.shrink();
+    final now = DateTime.now();
+    final greeting = _greetingByHour(now.hour);
+    final dateText = _todayJalaliLong();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Colors.green.shade700, Colors.green.shade500],
+          begin: Alignment.topRight,
+          end: Alignment.bottomLeft,
+        ),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.green.shade300.withOpacity(.30),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(.18),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.white.withOpacity(.45)),
+                ),
+                child: const Icon(Icons.waving_hand_rounded, color: Colors.white, size: 27),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'سلام ${_userGender == 'female' ? 'خانم' : 'آقای'} ${_userName.isEmpty ? 'کاربر عزیز' : _userName}',
+                      style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '$greeting • خوش آمدید',
+                      style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'امروز $dateText',
+                      style: TextStyle(color: Colors.white.withOpacity(.92), fontSize: 12, fontWeight: FontWeight.w500),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'امروز دیگر نمایش نده',
+                onPressed: _hideWelcomeForToday,
+                icon: const Icon(Icons.close_rounded, color: Colors.white),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _buildWelcomeEvents(),
+          const SizedBox(height: 10),
+          _buildLiveStats(),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              const Text(
+                'امروز دیگر نمایش نده',
+                style: TextStyle(color: Colors.white, fontSize: 12),
+              ),
+              Checkbox(
+                value: false,
+                onChanged: (_) => _hideWelcomeForToday(),
+                side: const BorderSide(color: Colors.white, width: 1.5),
+                checkColor: Colors.green,
+                fillColor: MaterialStatePropertyAll(Colors.white),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _initializeEntryNotifications() async {
@@ -1062,41 +1318,29 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   Widget _buildLiveStats() {
     final itemCount = _productDatabase.length;
     final totalStock = _getTotalProductStock();
-    final todaySales = _getTodaySalesTotal();
 
-    Widget stat({required String title, required String value}) {
+    Widget stat({required String title, required String value, required IconData icon}) {
       return Expanded(
         child: Container(
           margin: const EdgeInsets.symmetric(horizontal: 3),
           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 9),
           decoration: BoxDecoration(
-            color: Colors.white.withOpacity(.90),
+            color: Colors.white.withOpacity(.92),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: Theme.of(context).colorScheme.outlineVariant,
-            ),
+            border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
           ),
-          child: Column(
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Text(
-                title,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.red,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 5),
-              Text(
-                value,
-                textAlign: TextAlign.center,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.black,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w800,
+              Icon(icon, color: Colors.green.shade700, size: 21),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Column(
+                  children: [
+                    Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red, fontSize: 11, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 3),
+                    Text(value, textAlign: TextAlign.center, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w900)),
+                  ],
                 ),
               ),
             ],
@@ -1106,7 +1350,6 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
     }
 
     return Container(
-      margin: EdgeInsets.zero,
       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 4),
       decoration: BoxDecoration(
         color: Colors.white.withOpacity(.16),
@@ -1114,16 +1357,8 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
       ),
       child: Row(
         children: [
-          stat(
-              title: 'تعداد اقلام',
-              value: _toPersianDigits(itemCount.toString())),
-          stat(
-              title: 'کل موجودی کالا',
-              value: _toPersianDigits(totalStock.toString())),
-          stat(
-            title: 'فروش امروز',
-            value: '${_formatPrice(todaySales)} ریال',
-          ),
+          stat(title: 'تعداد کل اقلام', value: _toPersianDigits(itemCount.toString()), icon: Icons.inventory_2_outlined),
+          stat(title: 'تعداد کل موجودی', value: _toPersianDigits(totalStock.toString()), icon: Icons.warehouse_outlined),
         ],
       ),
     );
@@ -3102,6 +3337,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
               setState(() {
                 _userName = name;
               });
+              _loadCountdownEvents();
             },
           ),
         ),
@@ -4195,10 +4431,6 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   // ==================== صفحه اصلی با هدر جدید ====================
 
   Widget _buildMainView() {
-    final now = DateTime.now();
-    final greeting = _greetingByHour(now.hour);
-    final dateText = _todayJalaliLong();
-
     return GestureDetector(
       // ==================== با کلیک روی هر جای صفحه، کیبورد بسته شود ====================
       onTap: _closeKeyboard,
@@ -4212,89 +4444,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
         child: ListView(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
           children: [
-            Container(
-              padding: const EdgeInsets.fromLTRB(18, 18, 18, 20),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [
-                    Colors.green.shade700,
-                    Colors.green.shade500,
-                  ],
-                  begin: Alignment.topRight,
-                  end: Alignment.bottomLeft,
-                ),
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.green.shade300.withOpacity(.3),
-                    blurRadius: 18,
-                    offset: const Offset(0, 8),
-                  ),
-                ],
-              ),
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        width: 65,
-                        height: 65,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: Colors.white.withOpacity(0.5),
-                            width: 2,
-                          ),
-                          image: const DecorationImage(
-                            image: AssetImage(
-                                'assets/images/Logopit_1787568628075.png'),
-                            fit: BoxFit.cover,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '$greeting ${_userGender == 'female' ? 'خانم' : 'آقای'} ${_userName.isEmpty ? 'کاربر عزیز' : _userName}',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              dateText,
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(.90),
-                                fontSize: 13,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              'مدیریت فروش، بارنامه و موجودی',
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(.75),
-                                fontSize: 11,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  // آمار لحظه‌ای داخل همان کادر سبز
-                  _buildLiveStats(),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 10),
+            _buildWelcomeCard(),
 
             // ==================== جستجو با FocusNode ====================
             Row(
@@ -6593,6 +6743,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _nameController;
   bool _notificationsEnabled = false;
   bool _notificationBusy = false;
+  List<CountdownEvent> _countdownEvents = [];
 
   @override
   void initState() {
@@ -6600,6 +6751,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _darkMode = widget.isDarkMode;
     _nameController = TextEditingController(text: widget.userName);
     _loadNotificationSetting();
+    _loadCountdownEvents();
   }
 
   Future<void> _loadNotificationSetting() async {
@@ -6643,6 +6795,120 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _showSnackbar('❌ فعال‌سازی اعلان با خطا مواجه شد');
     } finally {
       if (mounted) setState(() => _notificationBusy = false);
+    }
+  }
+
+  Future<void> _loadCountdownEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('countdown_events');
+    List<CountdownEvent> events = [];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final list = jsonDecode(raw) as List;
+        events = list.map((e) => CountdownEvent.fromJson(Map<String, dynamic>.from(e))).toList();
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _countdownEvents = events);
+  }
+
+  Future<void> _saveCountdownEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('countdown_events', jsonEncode(_countdownEvents.map((e) => e.toJson()).toList()));
+  }
+
+  Future<void> _addOrEditCountdownEvent({CountdownEvent? existing, int? index}) async {
+    final titleController = TextEditingController(text: existing?.title ?? '');
+    final dateController = TextEditingController(text: existing?.date ?? _todayJalali());
+    final formKey = GlobalKey<FormState>();
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(existing == null ? 'افزودن رویداد جدید' : 'ویرایش رویداد'),
+        content: Form(
+          key: formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: titleController,
+                decoration: const InputDecoration(labelText: 'نام رویداد', prefixIcon: Icon(Icons.event_note)),
+                validator: (v) => v == null || v.trim().isEmpty ? 'نام رویداد را وارد کنید' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: dateController,
+                keyboardType: TextInputType.datetime,
+                decoration: const InputDecoration(labelText: 'تاریخ شمسی (مثلاً ۱۴۰۵/۰۵/۱۷)', prefixIcon: Icon(Icons.calendar_month)),
+                validator: (v) {
+                  final raw = (v ?? '').trim().replaceAll('۰','0').replaceAll('۱','1').replaceAll('۲','2').replaceAll('۳','3').replaceAll('۴','4').replaceAll('۵','5').replaceAll('۶','6').replaceAll('۷','7').replaceAll('۸','8').replaceAll('۹','9');
+                  final parts = raw.split('/');
+                  if (parts.length != 3) return 'فرمت تاریخ باید سال/ماه/روز باشد';
+                  final y = int.tryParse(parts[0]);
+                  final m = int.tryParse(parts[1]);
+                  final d = int.tryParse(parts[2]);
+                  if (y == null || m == null || d == null || m < 1 || m > 12 || d < 1 || d > 31) return 'تاریخ معتبر وارد کنید';
+                  try {
+                    final g = _jalaliToGregorian(y, m, d);
+                    final back = _gregorianToJalali(g.year, g.month, g.day);
+                    if (back[0] != y || back[1] != m || back[2] != d) return 'تاریخ معتبر وارد کنید';
+                  } catch (_) {
+                    return 'تاریخ معتبر وارد کنید';
+                  }
+                  return null;
+                },
+              ),
+              const SizedBox(height: 6),
+              const Align(alignment: Alignment.centerRight, child: Text('تاریخ را به صورت شمسی وارد کنید.', style: TextStyle(fontSize: 11, color: Colors.grey))),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('انصراف')),
+          ElevatedButton(
+            onPressed: () {
+              if (!formKey.currentState!.validate()) return;
+              final normalized = dateController.text.trim().replaceAll('۰','0').replaceAll('۱','1').replaceAll('۲','2').replaceAll('۳','3').replaceAll('۴','4').replaceAll('۵','5').replaceAll('۶','6').replaceAll('۷','7').replaceAll('۸','8').replaceAll('۹','9').split('/').map((e) => e.padLeft(2, '0')).toList();
+              normalized[0] = normalized[0].padLeft(4, '0');
+              dateController.text = normalized.join('/');
+              Navigator.pop(dialogContext, true);
+            },
+            child: const Text('ذخیره'),
+          ),
+        ],
+      ),
+    );
+    if (result == true) {
+      final normalized = dateController.text.trim().replaceAll('۰','0').replaceAll('۱','1').replaceAll('۲','2').replaceAll('۳','3').replaceAll('۴','4').replaceAll('۵','5').replaceAll('۶','6').replaceAll('۷','7').replaceAll('۸','8').replaceAll('۹','9').split('/').map((e) => e.padLeft(2, '0')).toList();
+      normalized[0] = normalized[0].padLeft(4, '0');
+      final event = CountdownEvent(title: titleController.text.trim(), date: normalized.join('/'));
+      setState(() {
+        if (index != null) {
+          _countdownEvents[index] = event;
+        } else {
+          _countdownEvents.add(event);
+        }
+      });
+      await _saveCountdownEvents();
+    }
+    titleController.dispose();
+    dateController.dispose();
+  }
+
+  Future<void> _deleteCountdownEvent(int index) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('حذف رویداد'),
+        content: Text('رویداد «${_countdownEvents[index].title}» حذف شود؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('انصراف')),
+          ElevatedButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('حذف')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      setState(() => _countdownEvents.removeAt(index));
+      await _saveCountdownEvents();
     }
   }
 
@@ -6769,6 +7035,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ? Colors.green
                             : Colors.grey,
                       ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            Card(
+              margin: const EdgeInsets.only(bottom: 16),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            '📅 رویدادهای روزشمار',
+                            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'افزودن رویداد',
+                          onPressed: () => _addOrEditCountdownEvent(),
+                          icon: const Icon(Icons.add_circle, color: Colors.green),
+                        ),
+                      ],
+                    ),
+                    const Divider(),
+                    const ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(Icons.inventory_2_outlined, color: Colors.green),
+                      title: Text('انبارگردانی'),
+                      subtitle: Text('رویداد ثابت برنامه است و از این بخش قابل تغییر نیست.'),
+                    ),
+                    if (_countdownEvents.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text('هنوز رویداد سفارشی ثبت نشده است.', style: TextStyle(color: Colors.grey)),
+                      )
+                    else
+                      ..._countdownEvents.asMap().entries.map((entry) {
+                        final index = entry.key;
+                        final event = entry.value;
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.event_available, color: Colors.blue),
+                          title: Text(event.title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                          subtitle: Text('تاریخ: ${_toPersianDigits(event.date)}'),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(icon: const Icon(Icons.edit_outlined), onPressed: () => _addOrEditCountdownEvent(existing: event, index: index)),
+                              IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), onPressed: () => _deleteCountdownEvent(index)),
+                            ],
+                          ),
+                        );
+                      }),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'می‌توانید رویدادهای مهم خودتان را با تاریخ شمسی اضافه کنید؛ انبارگردانی به صورت ثابت نمایش داده می‌شود.',
+                      style: TextStyle(fontSize: 11, color: Colors.grey),
                     ),
                   ],
                 ),
