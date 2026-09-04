@@ -12,6 +12,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:arabic_reshaper/arabic_reshaper.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:path_provider/path_provider.dart';
 
 // ==================== ابزارهای تاریخ و خوش‌آمدگویی ====================
@@ -220,6 +221,189 @@ pw.Widget _pdfCell(String text, pw.Font font,
             fontSize: 9,
             fontWeight: bold ? pw.FontWeight.bold : null,
             textAlign: align));
+
+// ==================== سرویس اعلان‌ها ====================
+
+class StoreNotificationService {
+  StoreNotificationService._();
+  static final StoreNotificationService instance = StoreNotificationService._();
+
+  final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+  static const String _logoAsset = 'assets/images/Logopit_1787568628075.png';
+  String? _logoPath;
+  bool _initialized = false;
+
+  Future<void> initialize() async {
+    if (_initialized) return;
+
+    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const darwin = DarwinInitializationSettings(
+      requestAlertPermission: false,
+      requestBadgePermission: false,
+      requestSoundPermission: false,
+    );
+
+    await _plugin.initialize(
+      const InitializationSettings(android: android, iOS: darwin),
+    );
+    _initialized = true;
+  }
+
+  Future<bool> requestPermissions() async {
+    await initialize();
+
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool('notification_permission_granted') == true) {
+      return true;
+    }
+
+    var granted = true;
+
+    final android = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    if (android != null) {
+      granted = await android.requestNotificationsPermission() ?? false;
+    }
+
+    final ios = _plugin.resolvePlatformSpecificImplementation<
+        IOSFlutterLocalNotificationsPlugin>();
+    if (ios != null) {
+      final iosGranted = await ios.requestPermissions(
+            alert: true,
+            badge: true,
+            sound: true,
+          ) ??
+          false;
+      granted = granted && iosGranted;
+    }
+
+    if (granted) {
+      await prefs.setBool('notification_permission_granted', true);
+    }
+    return granted;
+  }
+
+  Future<String> _ensureLogoFile() async {
+    if (_logoPath != null && await File(_logoPath!).exists()) {
+      return _logoPath!;
+    }
+    final dir = await getApplicationSupportDirectory();
+    final file = File('${dir.path}/store_notification_logo.png');
+    if (!await file.exists()) {
+      final data = await rootBundle.load(_logoAsset);
+      await file.writeAsBytes(data.buffer.asUint8List(), flush: true);
+    }
+    _logoPath = file.path;
+    return file.path;
+  }
+
+  NotificationDetails _details({String? imagePath}) {
+    final androidDetails = AndroidNotificationDetails(
+      'store_assistant_notifications',
+      'اعلان‌های فروشگاه',
+      channelDescription: 'اعلان ورود روزانه و ثبت فاکتور',
+      importance: Importance.max,
+      priority: Priority.high,
+      playSound: true,
+      enableVibration: true,
+      styleInformation: imagePath == null
+          ? const BigTextStyleInformation('')
+          : BigPictureStyleInformation(
+              FilePathAndroidBitmap(imagePath),
+              hideExpandedLargeIcon: false,
+            ),
+      largeIcon: imagePath == null ? null : FilePathAndroidBitmap(imagePath),
+    );
+
+    final iosDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+      attachments: imagePath == null
+          ? null
+          : <DarwinNotificationAttachment>[
+              DarwinNotificationAttachment(imagePath),
+            ],
+    );
+    return NotificationDetails(android: androidDetails, iOS: iosDetails);
+  }
+
+  String _jalaliNumericForDate(DateTime date) {
+    final j = _gregorianToJalali(date.year, date.month, date.day);
+    return '${_toPersianDigits(j[0].toString())}/${_toPersianDigits(j[1].toString().padLeft(2, '0'))}/${_toPersianDigits(j[2].toString().padLeft(2, '0'))}';
+  }
+
+  String _weekdayForDate(DateTime date) {
+    const weekdays = [
+      '',
+      'دوشنبه',
+      'سه‌شنبه',
+      'چهارشنبه',
+      'پنجشنبه',
+      'جمعه',
+      'شنبه',
+      'یکشنبه',
+    ];
+    return weekdays[date.weekday];
+  }
+
+  String _welcomeBody({
+    required String userName,
+    required String gender,
+    required DateTime date,
+  }) {
+    final prefix = gender == 'female' ? 'خانم' : 'آقای';
+    final greeting = _greetingByHour(date.hour);
+    final remaining = _inventoryDaysRemainingForDate(date);
+    final countdown = remaining == 0
+        ? 'امروز زمان انبارگردانی است.'
+        : '${_toPersianDigits(remaining.toString())} روز مانده تا انبارگردانی.';
+
+    return 'سلام $prefix $userName $greeting\n'
+        'امروز ${_weekdayForDate(date)} ${_jalaliNumericForDate(date)}\n'
+        '⏳ $countdown';
+  }
+
+  Future<void> showWelcomeNotification({
+    required String userName,
+    required String gender,
+    DateTime? date,
+  }) async {
+    await initialize();
+    final logoPath = await _ensureLogoFile();
+    final now = date ?? DateTime.now();
+
+    await _plugin.show(
+      1999,
+      'فروشگاه فرهنگی مذهبی کریم اهل بیت (ع)',
+      _welcomeBody(
+        userName: userName,
+        gender: gender,
+        date: now,
+      ),
+      _details(imagePath: logoPath),
+    );
+  }
+
+  Future<void> showInvoiceRegistered({
+    required String invoiceNumber,
+    required int total,
+    String? invoiceImagePath,
+  }) async {
+    await initialize();
+    final imagePath = invoiceImagePath ?? await _ensureLogoFile();
+    final body = 'فاکتور شماره ${_toPersianDigits(invoiceNumber)} با مبلغ '
+        '${_toPersianDigits(_formatPrice(total))} ریال ثبت شد.';
+    await _plugin.show(
+      DateTime.now().millisecondsSinceEpoch.remainder(100000000),
+      '🧾 ثبت نهایی فاکتور',
+      body,
+      _details(imagePath: imagePath),
+      payload: 'invoice_registered:$invoiceNumber',
+    );
+  }
+}
 
 // ==================== شروع برنامه ====================
 
@@ -745,6 +929,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
     _loadTrashAndCleanup();
     _loadInventoryCounts();
     _loadSettings();
+    _initializeEntryNotifications();
   }
 
   @override
@@ -773,6 +958,33 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
       _userGender =
           prefs.getString('user_gender') == 'female' ? 'female' : 'male';
     });
+  }
+
+  Future<void> _initializeEntryNotifications() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final name = prefs.getString('user_name') ?? '';
+      if (name.isEmpty) return;
+
+      final granted =
+          await StoreNotificationService.instance.requestPermissions();
+      if (!granted) return;
+
+      final todayKey = _todayJalali();
+      final lastDate = prefs.getString('last_entry_notification_date');
+      if (lastDate == todayKey) return;
+
+      final gender =
+          prefs.getString('user_gender') == 'female' ? 'female' : 'male';
+
+      await StoreNotificationService.instance.showWelcomeNotification(
+        userName: name,
+        gender: gender,
+      );
+      await prefs.setString('last_entry_notification_date', todayKey);
+    } catch (_) {
+      // اعلان نباید مانع اجرای برنامه شود.
+    }
   }
 
   String _formatNumber(String value) {
@@ -2175,6 +2387,76 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
     await _loadTrashAndCleanup();
   }
 
+  Future<String?> _createInvoiceNotificationImage(
+      List<SalesInvoice> invoices) async {
+    if (invoices.isEmpty) return null;
+    try {
+      final font = await _loadFont();
+      final pdf = pw.Document();
+      final total = invoices.fold<int>(
+        0,
+        (sum, invoice) => sum + invoice.totalPrice,
+      );
+      final number = invoices.first.number;
+      pdf.addPage(
+        pw.Page(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(30),
+          textDirection: pw.TextDirection.rtl,
+          build: (_) => pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            children: [
+              _pdfTextWidget(
+                'فاکتور فروش',
+                font,
+                fontSize: 24,
+                fontWeight: pw.FontWeight.bold,
+                textAlign: pw.TextAlign.center,
+              ),
+              pw.SizedBox(height: 20),
+              _pdfTextWidget(
+                'شماره فاکتور: ${_toPersianDigits(number.toString())}',
+                font,
+                fontSize: 15,
+                fontWeight: pw.FontWeight.bold,
+              ),
+              pw.SizedBox(height: 10),
+              _pdfTextWidget(
+                'تعداد اقلام: ${_toPersianDigits(invoices.length.toString())}',
+                font,
+                fontSize: 14,
+              ),
+              pw.SizedBox(height: 10),
+              _pdfTextWidget(
+                'مبلغ کل: ${_toPersianDigits(_formatPrice(total))} ریال',
+                font,
+                fontSize: 17,
+                fontWeight: pw.FontWeight.bold,
+              ),
+              pw.SizedBox(height: 18),
+              _pdfTextWidget(
+                'تاریخ: ${_todayJalaliLong()}',
+                font,
+                fontSize: 12,
+              ),
+            ],
+          ),
+        ),
+      );
+      final bytes = await pdf.save();
+      final pages =
+          await Printing.raster(bytes, pages: const [0], dpi: 120).toList();
+      if (pages.isEmpty) return null;
+      final png = await pages.first.toPng();
+      final dir = await getApplicationSupportDirectory();
+      final file = File('${dir.path}/invoice_notification_$number.png');
+      await file.writeAsBytes(png, flush: true);
+      return file.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _showSalesDialog({
     String? productName,
     String? productBarcode,
@@ -2630,6 +2912,53 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
                                       }
                                       await _saveSalesInvoices();
                                       await _saveProductDatabase();
+                                      if (editGroup == null &&
+                                          selected.isNotEmpty) {
+                                        final notificationInvoices =
+                                            <SalesInvoice>[];
+                                        for (var n = 0;
+                                            n < selected.length;
+                                            n++) {
+                                          final line = selected[n];
+                                          final p = line['product']
+                                              as ProductDatabaseItem;
+                                          final qty = line['quantity'] as int;
+                                          notificationInvoices.add(
+                                            SalesInvoice(
+                                              id: '$now-notification-$n',
+                                              number: invoiceNumber,
+                                              productName: p.name,
+                                              barcode: p.barcode,
+                                              price: p.sellPrice,
+                                              quantity: qty,
+                                              totalPrice: p.sellPrice * qty,
+                                              customerName:
+                                                  customerNameCtrl.text.trim(),
+                                              customerPhone:
+                                                  customerPhoneCtrl.text.trim(),
+                                              isCredit: isCredit,
+                                              date: _getTodayDate(),
+                                              createdAt: now,
+                                            ),
+                                          );
+                                        }
+                                        final notificationTotal =
+                                            notificationInvoices.fold<int>(
+                                          0,
+                                          (sum, invoice) =>
+                                              sum + invoice.totalPrice,
+                                        );
+                                        final imagePath =
+                                            await _createInvoiceNotificationImage(
+                                                notificationInvoices);
+                                        await StoreNotificationService.instance
+                                            .showInvoiceRegistered(
+                                          invoiceNumber:
+                                              invoiceNumber.toString(),
+                                          total: notificationTotal,
+                                          invoiceImagePath: imagePath,
+                                        );
+                                      }
                                       _addSmartLog(editGroup != null
                                           ? '✏️ فاکتور شماره $invoiceNumber ویرایش شد'
                                           : '💰 فاکتور شماره $invoiceNumber با ${selected.length} قلم ثبت شد');
