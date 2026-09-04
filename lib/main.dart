@@ -263,7 +263,10 @@ class StoreNotificationService {
     final android = _plugin.resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>();
     if (android != null) {
-      granted = await android.requestNotificationsPermission() ?? false;
+      final enabled = await android.areNotificationsEnabled();
+      if (enabled != true) {
+        granted = await android.requestNotificationsPermission() ?? false;
+      }
     }
 
     final ios = _plugin.resolvePlatformSpecificImplementation<
@@ -929,7 +932,11 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
     _loadTrashAndCleanup();
     _loadInventoryCounts();
     _loadSettings();
-    _initializeEntryNotifications();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _initializeEntryNotifications();
+      }
+    });
   }
 
   @override
