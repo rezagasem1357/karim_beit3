@@ -231,13 +231,15 @@ class StoreNotificationService {
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
   static const String _logoAsset = 'assets/images/Logopit_1787568628075.png';
+  static const String _enabledKey = 'notifications_enabled';
+  static const String _channelId = 'store_assistant_notifications';
   String? _logoPath;
   bool _initialized = false;
 
   Future<void> initialize() async {
     if (_initialized) return;
 
-    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const android = AndroidInitializationSettings('@mipmap/launcher_icon');
     const darwin = DarwinInitializationSettings(
       requestAlertPermission: false,
       requestBadgePermission: false,
@@ -250,13 +252,33 @@ class StoreNotificationService {
     _initialized = true;
   }
 
-  Future<bool> requestPermissions() async {
+  Future<bool> isEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(_enabledKey) != true) return false;
+    return _platformPermissionGranted();
+  }
+
+  Future<bool> _platformPermissionGranted() async {
     await initialize();
 
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.getBool('notification_permission_granted') == true) {
-      return true;
+    final android = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    if (android != null) {
+      return await android.areNotificationsEnabled() ?? false;
     }
+
+    final ios = _plugin.resolvePlatformSpecificImplementation<
+        IOSFlutterLocalNotificationsPlugin>();
+    if (ios != null) {
+      final details = await ios.checkPermissions();
+      return details?.isEnabled ?? false;
+    }
+
+    return false;
+  }
+
+  Future<bool> enableNotifications() async {
+    await initialize();
 
     var granted = true;
 
@@ -272,19 +294,28 @@ class StoreNotificationService {
     final ios = _plugin.resolvePlatformSpecificImplementation<
         IOSFlutterLocalNotificationsPlugin>();
     if (ios != null) {
-      final iosGranted = await ios.requestPermissions(
-            alert: true,
-            badge: true,
-            sound: true,
-          ) ??
-          false;
-      granted = granted && iosGranted;
+      final current = await ios.checkPermissions();
+      if (current?.isEnabled != true) {
+        granted = await ios.requestPermissions(
+              alert: true,
+              badge: true,
+              sound: true,
+            ) ??
+            false;
+      }
     }
 
     if (granted) {
-      await prefs.setBool('notification_permission_granted', true);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_enabledKey, true);
     }
+
     return granted;
+  }
+
+  Future<void> disableNotifications() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_enabledKey, false);
   }
 
   Future<String> _ensureLogoFile() async {
@@ -303,9 +334,9 @@ class StoreNotificationService {
 
   NotificationDetails _details({String? imagePath}) {
     final androidDetails = AndroidNotificationDetails(
-      'store_assistant_notifications',
+      _channelId,
       'اعلان‌های فروشگاه',
-      channelDescription: 'اعلان ورود روزانه و ثبت فاکتور',
+      channelDescription: 'اعلان فعال‌سازی و ثبت فاکتور فروش',
       importance: Importance.max,
       priority: Priority.high,
       playSound: true,
@@ -368,11 +399,22 @@ class StoreNotificationService {
         '⏳ $countdown';
   }
 
+  Future<void> showActivationNotification() async {
+    await initialize();
+    await _plugin.show(
+      1998,
+      'فروشگاه فرهنگی مذهبی کریم اهل بیت (ع)',
+      'سیستم اعلان فعال شد.',
+      _details(),
+    );
+  }
+
   Future<void> showWelcomeNotification({
     required String userName,
     required String gender,
     DateTime? date,
   }) async {
+    if (!await isEnabled()) return;
     await initialize();
     final logoPath = await _ensureLogoFile();
     final now = date ?? DateTime.now();
@@ -394,13 +436,13 @@ class StoreNotificationService {
     required int total,
     String? invoiceImagePath,
   }) async {
+    if (!await isEnabled()) return;
     await initialize();
     final imagePath = invoiceImagePath ?? await _ensureLogoFile();
-    final body = 'فاکتور شماره ${_toPersianDigits(invoiceNumber)} با مبلغ '
-        '${_toPersianDigits(_formatPrice(total))} ریال ثبت شد.';
+    final body = 'فاکتور فروش شماره ${_toPersianDigits(invoiceNumber)} ایجاد شد.';
     await _plugin.show(
       DateTime.now().millisecondsSinceEpoch.remainder(100000000),
-      '🧾 ثبت نهایی فاکتور',
+      'فروشگاه فرهنگی مذهبی کریم اهل بیت (ع)',
       body,
       _details(imagePath: imagePath),
       payload: 'invoice_registered:$invoiceNumber',
@@ -970,11 +1012,13 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   Future<void> _initializeEntryNotifications() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool('notifications_enabled') != true) return;
+
       final name = prefs.getString('user_name') ?? '';
       if (name.isEmpty) return;
 
       final granted =
-          await StoreNotificationService.instance.requestPermissions();
+          await StoreNotificationService.instance.isEnabled();
       if (!granted) return;
 
       final todayKey = _todayJalali();
@@ -6547,12 +6591,59 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _darkMode;
   late TextEditingController _nameController;
+  bool _notificationsEnabled = false;
+  bool _notificationBusy = false;
 
   @override
   void initState() {
     super.initState();
     _darkMode = widget.isDarkMode;
     _nameController = TextEditingController(text: widget.userName);
+    _loadNotificationSetting();
+  }
+
+  Future<void> _loadNotificationSetting() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _notificationsEnabled = prefs.getBool('notifications_enabled') ?? false;
+    });
+  }
+
+  Future<void> _toggleNotifications(bool value) async {
+    if (_notificationBusy) return;
+    setState(() => _notificationBusy = true);
+
+    try {
+      if (value) {
+        final granted =
+            await StoreNotificationService.instance.enableNotifications();
+        if (!mounted) return;
+
+        if (!granted) {
+          setState(() => _notificationsEnabled = false);
+          _showSnackbar(
+            '⚠️ دسترسی اعلان فعال نشد. لطفاً اجازه اعلان برنامه را در تنظیمات گوشی فعال کنید.',
+          );
+          return;
+        }
+
+        setState(() => _notificationsEnabled = true);
+        _showSnackbar('✅ سیستم اعلان فعال شد');
+        await StoreNotificationService.instance.showActivationNotification();
+      } else {
+        await StoreNotificationService.instance.disableNotifications();
+        if (!mounted) return;
+        setState(() => _notificationsEnabled = false);
+        _showSnackbar('اعلان‌های برنامه غیرفعال شد');
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _notificationsEnabled = false);
+      _showSnackbar('❌ فعال‌سازی اعلان با خطا مواجه شد');
+    } finally {
+      if (mounted) setState(() => _notificationBusy = false);
+    }
   }
 
   @override
@@ -6640,6 +6731,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       secondary: Icon(
                         _darkMode ? Icons.dark_mode : Icons.light_mode,
                         color: _darkMode ? Colors.white : Colors.orange,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            Card(
+              margin: const EdgeInsets.only(bottom: 16),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '🔔 اعلان‌ها',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const Divider(),
+                    SwitchListTile(
+                      title: const Text('فعال سازی اعلان اپلیکیشن'),
+                      subtitle: Text(
+                        _notificationBusy
+                            ? 'در حال بررسی دسترسی...'
+                            : (_notificationsEnabled
+                                ? 'فعال'
+                                : 'غیرفعال'),
+                      ),
+                      value: _notificationsEnabled,
+                      onChanged: _notificationBusy ? null : _toggleNotifications,
+                      secondary: Icon(
+                        _notificationsEnabled
+                            ? Icons.notifications_active
+                            : Icons.notifications_off_outlined,
+                        color: _notificationsEnabled
+                            ? Colors.green
+                            : Colors.grey,
                       ),
                     ),
                   ],
